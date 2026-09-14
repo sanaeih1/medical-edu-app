@@ -1,6 +1,0 @@
-# این فایل فقط برای زمانی لازم است که بخواهید به‌جای داشبورد، از خط فرمان
-# Wrangler برای دیپلوی استفاده کنید.
-
-name = "medical-edu-app"
-compatibility_date = "2024-09-23"
-pages_build_output_dir = "."
