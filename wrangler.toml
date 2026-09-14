@@ -1,13 +1,6 @@
 # این فایل فقط برای زمانی لازم است که بخواهید به‌جای داشبورد، از خط فرمان
-# Wrangler برای دیپلوی استفاده کنید. برای مسیر پیشنهادی (GitHub + داشبورد
-# Cloudflare Pages) به فایل DEPLOY-README.md مراجعه کنید و همان‌جا از بخش
-# Bindings دیتابیس D1 را بدون نیاز به این فایل متصل کنید.
+# Wrangler برای دیپلوی استفاده کنید.
 
 name = "medical-edu-app"
 compatibility_date = "2024-09-23"
 pages_build_output_dir = "."
-
-[[d1_databases]]
-binding = "DB"
-database_name = "medical-edu-db"
-database_id = "REPLACE_WITH_YOUR_DATABASE_ID"
