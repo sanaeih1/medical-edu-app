@@ -1,11 +1,18 @@
-/book-part*.js
+/*.js
   Cache-Control: public, max-age=3600, stale-while-revalidate=86400
 
-/questions-part*.js
+/*.css
   Cache-Control: public, max-age=3600, stale-while-revalidate=86400
 
 /manifest.json
   Cache-Control: public, max-age=86400
 
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/sw.js
+  Cache-Control: public, max-age=0, must-revalidate
+
 /*
   X-Content-Type-Options: nosniff
+  X-Frame-Options: SAMEORIGIN
