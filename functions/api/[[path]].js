@@ -91,7 +91,29 @@ async function requireAdmin(request, env) {
   return user;
 }
 function publicUser(u) {
-  return { id: u.id, username: u.username, name: u.name, gender: u.gender, field: u.field, role: u.role, created: u.created_at };
+  return { id: u.id, username: u.username, name: u.name, gender: u.gender, field: u.field, role: u.role, created: u.created_at, nationalId: u.national_id || null };
+}
+
+/* ---------- گزارش فعالیت/خطا (برای بخش «گزارش سیستم» در پنل ادمین) ---------- */
+async function logEvent(env, level, action, details, userId) {
+  try {
+    await env.DB.prepare(
+      'INSERT INTO activity_log (ts, level, actor_user_id, action, details_json) VALUES (?, ?, ?, ?, ?)'
+    ).bind(Date.now(), level, userId || null, action, details ? JSON.stringify(details) : null).run();
+  } catch (e) { /* اگر خود ثبتِ لاگ خطا بدهد، نباید کل درخواست را متوقف کند */ }
+}
+
+/* ---------- اعتبارسنجی کد ملی ایران (الگوریتم رسمی چک‌دیجیت) ---------- */
+function isValidIranianNationalId(code) {
+  code = String(code || '').trim();
+  if (!/^\d{10}$/.test(code)) return false;
+  if (/^(\d)\1{9}$/.test(code)) return false; // همه ارقام یکسان (نامعتبر)
+  const digits = code.split('').map(Number);
+  const check = digits[9];
+  let sum = 0;
+  for (let i = 0; i < 9; i++) sum += digits[i] * (10 - i);
+  const rem = sum % 11;
+  return rem < 2 ? check === rem : check === 11 - rem;
 }
 
 /* ---------- ثبت‌نام / ورود / رمز عبور ---------- */
@@ -102,27 +124,32 @@ async function handleRegister(request, env) {
   const name = (body.name || '').trim();
   const gender = body.gender || 'نامشخص';
   const field = body.field || 'عمومی';
+  const nationalId = (body.nationalId || '').trim();
 
-  if (!username || !password || !name) return errorResponse('همه فیلدها الزامی است', 400);
+  if (!username || !password || !name || !nationalId) return errorResponse('همه فیلدها الزامی است', 400);
   if (username.length < 3) return errorResponse('نام کاربری باید حداقل ۳ کاراکتر باشد', 400);
   if (password.length < 4) return errorResponse('رمز عبور باید حداقل ۴ کاراکتر باشد', 400);
+  if (!isValidIranianNationalId(nationalId)) return errorResponse('کد ملی وارد شده معتبر نیست', 400);
 
   const existing = await env.DB.prepare('SELECT id FROM users WHERE username = ?').bind(username).first();
   if (existing) return errorResponse('این نام کاربری قبلاً ثبت شده است', 409);
+  const dup = await env.DB.prepare('SELECT id FROM users WHERE national_id = ?').bind(nationalId).first();
+  if (dup) return errorResponse('این کد ملی قبلاً برای ثبت‌نام استفاده شده است', 409);
 
   const id = 'u' + Date.now() + Math.floor(Math.random() * 100000);
   const { hash, salt } = await hashPassword(password);
   const now = Date.now();
 
   await env.DB.prepare(
-    `INSERT INTO users (id, username, password_hash, salt, name, gender, field, role, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'user', ?)`
-  ).bind(id, username, hash, salt, name, gender, field, now).run();
+    `INSERT INTO users (id, username, password_hash, salt, name, gender, field, national_id, role, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'user', ?)`
+  ).bind(id, username, hash, salt, name, gender, field, nationalId, now).run();
 
   await env.DB.prepare('INSERT INTO sessions_log (user_id, ts, action) VALUES (?, ?, ?)').bind(id, now, 'register').run();
+  await logEvent(env, 'info', 'register', { username }, id);
 
   const token = await createToken(env, id);
-  return jsonResponse({ token, user: publicUser({ id, username, name, gender, field, role: 'user', created_at: now }) });
+  return jsonResponse({ token, user: publicUser({ id, username, name, gender, field, national_id: nationalId, role: 'user', created_at: now }) });
 }
 
 async function handleLogin(request, env) {
@@ -132,13 +159,14 @@ async function handleLogin(request, env) {
   if (!username || !password) return errorResponse('نام کاربری و رمز عبور الزامی است', 400);
 
   const user = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(username).first();
-  if (!user) return errorResponse('نام کاربری یا رمز عبور نادرست است', 401);
+  if (!user) { await logEvent(env, 'warn', 'login_failed', { username }); return errorResponse('نام کاربری یا رمز عبور نادرست است', 401); }
 
   const ok = await verifyPassword(password, user.salt, user.password_hash);
-  if (!ok) return errorResponse('نام کاربری یا رمز عبور نادرست است', 401);
+  if (!ok) { await logEvent(env, 'warn', 'login_failed', { username }, user.id); return errorResponse('نام کاربری یا رمز عبور نادرست است', 401); }
 
   const now = Date.now();
   await env.DB.prepare('INSERT INTO sessions_log (user_id, ts, action) VALUES (?, ?, ?)').bind(user.id, now, 'login').run();
+  await logEvent(env, 'info', 'login', { username }, user.id);
 
   const token = await createToken(env, user.id);
   return jsonResponse({ token, user: publicUser(user) });
@@ -332,7 +360,7 @@ async function handleAdminUsersGet(request, env) {
   const loginCounts = await env.DB.prepare(`SELECT user_id, COUNT(*) as cnt FROM sessions_log WHERE action = 'login' GROUP BY user_id`).all();
   const cntMap = {};
   loginCounts.results.forEach(r => { cntMap[r.user_id] = r.cnt; });
-  const list = users.results.map(u => ({ id: u.id, username: u.username, name: u.name, gender: u.gender, field: u.field, created: u.created_at, logins: cntMap[u.id] || 0 }));
+  const list = users.results.map(u => ({ id: u.id, username: u.username, name: u.name, gender: u.gender, field: u.field, nationalId: u.national_id || null, created: u.created_at, logins: cntMap[u.id] || 0 }));
   const [resultsCount, susCount] = await Promise.all([
     env.DB.prepare('SELECT COUNT(*) as c FROM results').first(),
     env.DB.prepare('SELECT COUNT(*) as c FROM sus_responses').first()
@@ -350,14 +378,14 @@ async function handleAdminUserGet(request, env, id) {
   const post = [...results.results].reverse().find(r => r.type === 'posttest');
   const chapterCount = results.results.filter(r => r.type === 'chapter').length;
   return jsonResponse({
-    user: { id: user.id, username: user.username, name: user.name, gender: user.gender, field: user.field, created: user.created_at },
+    user: { id: user.id, username: user.username, name: user.name, gender: user.gender, field: user.field, nationalId: user.national_id || null, created: user.created_at },
     logins: logins ? logins.cnt : 0, pre: pre ? pre.pct : null, post: post ? post.pct : null,
     sus: sus ? sus.score : null, chapterQuizzes: chapterCount
   });
 }
 async function handleAdminUserDelete(request, env, id) {
-  await requireAdmin(request, env);
-  const user = await env.DB.prepare(`SELECT id FROM users WHERE id = ? AND role != 'admin'`).bind(id).first();
+  const admin = await requireAdmin(request, env);
+  const user = await env.DB.prepare(`SELECT id, username FROM users WHERE id = ? AND role != 'admin'`).bind(id).first();
   if (!user) return errorResponse('کاربر یافت نشد', 404);
   await env.DB.batch([
     env.DB.prepare('DELETE FROM progress WHERE user_id = ?').bind(id),
@@ -368,7 +396,35 @@ async function handleAdminUserDelete(request, env, id) {
     env.DB.prepare('DELETE FROM auth_tokens WHERE user_id = ?').bind(id),
     env.DB.prepare('DELETE FROM users WHERE id = ?').bind(id)
   ]);
+  await logEvent(env, 'warn', 'admin_delete_user', { deletedUsername: user.username }, admin.id);
   return jsonResponse({ ok: true });
+}
+async function handleAdminResetUserPassword(request, env, id) {
+  const admin = await requireAdmin(request, env);
+  const body = await request.json().catch(() => ({}));
+  const newPassword = body.newPassword || '';
+  if (newPassword.length < 4) return errorResponse('رمز عبور جدید باید حداقل ۴ کاراکتر باشد', 400);
+  const user = await env.DB.prepare(`SELECT id, username FROM users WHERE id = ? AND role != 'admin'`).bind(id).first();
+  if (!user) return errorResponse('کاربر یافت نشد', 404);
+  const { hash, salt } = await hashPassword(newPassword);
+  await env.DB.prepare('UPDATE users SET password_hash = ?, salt = ? WHERE id = ?').bind(hash, salt, id).run();
+  // بعد از بازنشانی رمز، نشست‌های فعال آن کاربر باطل می‌شود تا با رمز جدید دوباره وارد شود
+  await env.DB.prepare('DELETE FROM auth_tokens WHERE user_id = ?').bind(id).run();
+  await logEvent(env, 'warn', 'admin_reset_password', { targetUsername: user.username }, admin.id);
+  return jsonResponse({ ok: true });
+}
+async function handleAdminLogs(request, env) {
+  await requireAdmin(request, env);
+  const rows = await env.DB.prepare(`
+    SELECT l.id, l.ts, l.level, l.action, l.details_json, u.username AS actor_username
+    FROM activity_log l LEFT JOIN users u ON u.id = l.actor_user_id
+    ORDER BY l.ts DESC LIMIT 200
+  `).all();
+  const logs = rows.results.map(r => ({
+    id: r.id, ts: r.ts, level: r.level, action: r.action, actor: r.actor_username || null,
+    details: r.details_json ? JSON.parse(r.details_json) : null
+  }));
+  return jsonResponse({ logs });
 }
 async function handleAdminResults(request, env) {
   await requireAdmin(request, env);
@@ -404,8 +460,8 @@ async function handleAdminExport(request, env) {
     const logins = await env.DB.prepare(`SELECT user_id, COUNT(*) c FROM sessions_log WHERE action='login' GROUP BY user_id`).all();
     const loginMap = {}; logins.results.forEach(l => { loginMap[l.user_id] = l.c; });
     rows.push(['--- کاربران ---']);
-    rows.push(['نام', 'نام کاربری', 'جنسیت', 'رشته', 'تاریخ عضویت', 'تعداد ورود']);
-    users.results.forEach(u => rows.push([u.name, u.username, u.gender, u.field, fmtDate(u.created_at), loginMap[u.id] || 0]));
+    rows.push(['نام', 'نام کاربری', 'کد ملی', 'جنسیت', 'رشته', 'تاریخ عضویت', 'تعداد ورود']);
+    users.results.forEach(u => rows.push([u.name, u.username, u.national_id || '', u.gender, u.field, fmtDate(u.created_at), loginMap[u.id] || 0]));
     rows.push([]);
   }
   if (type === 'results' || type === 'all') {
@@ -438,6 +494,12 @@ async function handleAdminExport(request, env) {
     rows.push(['--- تاریخچه ورود ---']);
     rows.push(['کاربر', 'زمان', 'عملیات']);
     sessions.results.forEach(s => rows.push([s.uname, fmtDate(s.ts), s.action]));
+  }
+  if (type === 'logs') {
+    const logs = await env.DB.prepare(`SELECT l.*, u.username AS uname FROM activity_log l LEFT JOIN users u ON u.id=l.actor_user_id ORDER BY l.ts DESC LIMIT 500`).all();
+    rows.push(['--- گزارش سیستم ---']);
+    rows.push(['زمان', 'سطح', 'عملیات', 'کاربر مرتبط', 'جزئیات']);
+    logs.results.forEach(l => rows.push([fmtDate(l.ts), l.level, l.action, l.uname || '', l.details_json || '']));
   }
   const csv = '\ufeff' + toCSV(rows);
   return new Response(csv, { headers: { 'Content-Type': 'text/csv; charset=utf-8', 'Content-Disposition': `attachment; filename="medical-edu-${type}-${Date.now()}.csv"` } });
@@ -500,16 +562,19 @@ export async function onRequest(context) {
     if (method === 'GET' && p === 'settings') return await handleSettingsGet(env);
     if (method === 'POST' && p === 'admin/settings') return await handleAdminSettingsPost(request, env);
     if (method === 'GET' && p === 'admin/users') return await handleAdminUsersGet(request, env);
-    if (method === 'GET' && segs[0] === 'admin' && segs[1] === 'users' && segs[2]) return await handleAdminUserGet(request, env, segs[2]);
-    if (method === 'DELETE' && segs[0] === 'admin' && segs[1] === 'users' && segs[2]) return await handleAdminUserDelete(request, env, segs[2]);
+    if (method === 'GET' && segs[0] === 'admin' && segs[1] === 'users' && segs[2] && !segs[3]) return await handleAdminUserGet(request, env, segs[2]);
+    if (method === 'DELETE' && segs[0] === 'admin' && segs[1] === 'users' && segs[2] && !segs[3]) return await handleAdminUserDelete(request, env, segs[2]);
+    if (method === 'POST' && segs[0] === 'admin' && segs[1] === 'users' && segs[2] && segs[3] === 'reset-password') return await handleAdminResetUserPassword(request, env, segs[2]);
     if (method === 'GET' && p === 'admin/results') return await handleAdminResults(request, env);
     if (method === 'GET' && p === 'admin/sus') return await handleAdminSus(request, env);
+    if (method === 'GET' && p === 'admin/logs') return await handleAdminLogs(request, env);
     if (method === 'GET' && segs[0] === 'admin' && segs[1] === 'export') return await handleAdminExport(request, env);
     if (method === 'POST' && p === 'admin/reset') return await handleAdminReset(request, env);
     return errorResponse('مسیر یافت نشد', 404);
   } catch (err) {
     const status = err && err.status ? err.status : 500;
     const message = (err && err.message) ? err.message : 'خطای داخلی سرور';
+    if (status === 500) { await logEvent(env, 'error', 'server_error', { path: p, method, message: err && err.message }); }
     return jsonResponse({ error: message }, status);
   }
 }
